@@ -1,105 +1,17 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+"""GPT with persistent parameter tensors and an explicit functional forward.
+
+Read GPT.__init__ for parameter shapes, initialize_parameters for initial values,
+and GPT.forward for the complete computation. No trainable layers are created
+inside forward. Parameters are registered once in self.params.
 """
 
-import math
 import inspect
+import math
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.nn import functional as F
-
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
-
-    def __init__(self, ndim, bias):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
-
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-class MLP(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-class Block(nn.Module):
-    """Store one layer's modules; GPT.forward spells out their execution order."""
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
 
 @dataclass
 class GPTConfig:
@@ -112,100 +24,169 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     # INIT | TABLE1: baseline σ/σ² and constant Norm/bias values, not paper scaling.
     init_std: float = 0.02
-    residual_projection_scaling: bool = True
+    attn_out_init_std: float | None = None
+    mlp_out_init_std: float | None = None
     norm_weight_init: float = 1.0
     norm_bias_init: float = 0.0
     linear_bias_init: float = 0.0
 
+    def __post_init__(self):
+        # Resolve defaults here, before GPT is constructed. Explicit values win.
+        # NanoGPT default: output projection entries ~ N(0, σ²/(2L)).
+        default_std = self.init_std / math.sqrt(2 * self.n_layer)
+        if self.attn_out_init_std is None:
+            self.attn_out_init_std = default_std
+        if self.mlp_out_init_std is None:
+            self.mlp_out_init_std = default_std
+
 
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        assert config.vocab_size is not None
-        assert config.block_size is not None
+        assert config.n_embd % config.n_head == 0
         self.config = config
+        N = config.n_embd
+        self.params = nn.ParameterDict()
+        p = self.params
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # Share the input embedding and output projection weights.
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        # Registration helpers only create/store tensors; they do no forward work.
+        def add_norm(name):
+            p[name + '_weight'] = nn.Parameter(torch.ones(N))
+            p[name + '_bias'] = nn.Parameter(torch.zeros(N)) if config.bias else None
 
-        # init all weights
-        self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if config.residual_projection_scaling and pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=config.init_std/math.sqrt(2 * config.n_layer))
+        def add_linear(name, fan_in, fan_out, bias=True):
+            # Temporary Linear supplies the original constructor initialization.
+            # Only its parameters survive; the module is never used for computation.
+            layer = nn.Linear(fan_in, fan_out, bias=bias)
+            p[name + '_weight'] = layer.weight
+            p[name + '_bias'] = layer.bias
 
-        # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        # Preserve NanoGPT's parameter creation order and random draws.
+        p['token_embedding'] = nn.Embedding(config.vocab_size, N).weight
+        p['position_embedding'] = nn.Embedding(config.block_size, N).weight
+        for i in range(config.n_layer):
+            add_norm(f'h{i}_attn_norm')
+            add_linear(f'h{i}_qkv', N, 3 * N, config.bias)
+            add_linear(f'h{i}_attn_out', N, N, config.bias)
+            add_norm(f'h{i}_mlp_norm')
+            add_linear(f'h{i}_mlp_in', N, 4 * N, config.bias)
+            add_linear(f'h{i}_mlp_out', 4 * N, N, config.bias)
+        add_norm('final_norm')
+        add_linear('head', N, config.vocab_size, bias=False)
+
+        # One shared parameter receives both embedding and output-head gradients.
+        p['token_embedding'] = p['head_weight']
+        self.initialize_parameters()
+        print('number of parameters: %.2fM' % (self.get_num_params() / 1e6,))
+
+    def initialize_parameters(self):
+        """INIT | TABLE1: explicit matrix standard deviations and Norm γ/β.
+
+        Called by __init__, never by forward. Settings below are initial values;
+        the optimizer can subsequently update these same parameter tensors.
+        Keep random draws in NanoGPT order, including the tied head and the
+        second initialization of residual projections, for exact baseline parity.
+        """
+        cfg, p = self.config, self.params
+        sigma = cfg.init_std  # Standard deviation σ; variance is σ².
+
+        # 1. Token and learned position embeddings: each entry ~ N(0, σ²).
+        nn.init.normal_(p['token_embedding'], mean=0.0, std=sigma)
+        nn.init.normal_(p['position_embedding'], mean=0.0, std=sigma)
+
+        for i in range(cfg.n_layer):
+            # 2. Attention Pre-Norm γ; all optional biases are filled below.
+            nn.init.constant_(p[f'h{i}_attn_norm_weight'], cfg.norm_weight_init)
+
+            # 3. Attention: packed W_Q/W_K/W_V, then output projection W_O.
+            # All entries start ~ N(0, σ²); step 7 sets W_O's final initial value.
+            nn.init.normal_(p[f'h{i}_qkv_weight'], mean=0.0, std=sigma)
+            nn.init.normal_(p[f'h{i}_attn_out_weight'], mean=0.0, std=sigma)
+
+            # 4. MLP Pre-Norm: its own γ, with the same initial value.
+            nn.init.constant_(p[f'h{i}_mlp_norm_weight'], cfg.norm_weight_init)
+
+            # 5. MLP: expansion and output weights start ~ N(0, σ²).
+            # Step 7 sets the output projection's final initial value.
+            nn.init.normal_(p[f'h{i}_mlp_in_weight'], mean=0.0, std=sigma)
+            nn.init.normal_(p[f'h{i}_mlp_out_weight'], mean=0.0, std=sigma)
+
+        # 6. Final LayerNorm and vocabulary head (no head bias).
+        nn.init.constant_(p['final_norm_weight'], cfg.norm_weight_init)
+        # This also overwrites token_embedding: they share the SAME tensor.
+        nn.init.normal_(p['head_weight'], mean=0.0, std=sigma)
+
+        # 7. Output projections: use the standard deviations supplied by config.
+        # This changes initial weights, not the residual addition in forward.
+        for i in range(cfg.n_layer):
+            nn.init.normal_(p[f'h{i}_attn_out_weight'], mean=0.0, std=cfg.attn_out_init_std)
+            nn.init.normal_(p[f'h{i}_mlp_out_weight'], mean=0.0, std=cfg.mlp_out_init_std)
+
+        # 8. Optional biases: LayerNorm β and linear b have separate initial values.
+        # Constant fills consume no random numbers, so they can be grouped here.
+        if cfg.bias:
+            for i in range(cfg.n_layer):
+                nn.init.constant_(p[f'h{i}_attn_norm_bias'], cfg.norm_bias_init)
+                nn.init.constant_(p[f'h{i}_mlp_norm_bias'], cfg.norm_bias_init)
+                nn.init.constant_(p[f'h{i}_qkv_bias'], cfg.linear_bias_init)
+                nn.init.constant_(p[f'h{i}_attn_out_bias'], cfg.linear_bias_init)
+                nn.init.constant_(p[f'h{i}_mlp_in_bias'], cfg.linear_bias_init)
+                nn.init.constant_(p[f'h{i}_mlp_out_bias'], cfg.linear_bias_init)
+            nn.init.constant_(p['final_norm_bias'], cfg.norm_bias_init)
 
     def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
-        return n_params
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std)
-            if module.bias is not None:
-                torch.nn.init.constant_(module.bias, self.config.linear_bias_init)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std)
-        elif isinstance(module, LayerNorm):
-            # INIT | TABLE1: shared Pre-LN/Final-LN constants, γ and optional β.
-            torch.nn.init.constant_(module.weight, self.config.norm_weight_init)
-            if module.bias is not None:
-                torch.nn.init.constant_(module.bias, self.config.norm_bias_init)
+        """Count unique parameters; optionally exclude positions as in NanoGPT."""
+        count = sum(p.numel() for p in self.parameters())
+        return count - self.params['position_embedding'].numel() if non_embedding else count
 
     def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        """Token IDs → embeddings → repeated attention/MLP → final norm → logits."""
+        cfg, p = self.config, self.params
+        B, T = idx.shape
+        N, H = cfg.n_embd, cfg.n_head
+        D = N // H
+        assert T <= cfg.block_size
+        pos = torch.arange(T, dtype=torch.long, device=idx.device)
 
-        # Token + position embeddings form the input to the first layer.
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        # 1. Embedding lookup and learned absolute positions.
+        token_embedding = F.embedding(idx, p['token_embedding'])
+        position_embedding = F.embedding(pos, p['position_embedding'])
+        x = F.dropout(token_embedding + position_embedding, cfg.dropout, self.training)
 
-        for block in self.transformer.h:
-            # Pre-Norm → Attention → residual addition.
-            attention_input = block.ln_1(x)
-            attention_output = block.attn(attention_input)
-            x = x + attention_output
+        for i in range(cfg.n_layer):
+            # 2. Pre-Norm: explicit γ and optional β for this layer.
+            u = F.layer_norm(x, (N,), p[f'h{i}_attn_norm_weight'],
+                             p[f'h{i}_attn_norm_bias'], eps=1e-5)
 
-            # Pre-Norm → MLP → residual addition.
-            mlp_input = block.ln_2(x)
-            mlp_output = block.mlp(mlp_input)
-            x = x + mlp_output
+            # 3. Project Q/K/V, split heads, and apply causal attention.
+            q, k, v = F.linear(u, p[f'h{i}_qkv_weight'], p[f'h{i}_qkv_bias']).split(N, dim=-1)
+            k = k.view(B, T, H, D).transpose(1, 2)
+            q = q.view(B, T, H, D).transpose(1, 2)
+            v = v.view(B, T, H, D).transpose(1, 2)
+            a = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True,
+                dropout_p=cfg.dropout if self.training else 0.0,
+            )  # Default QK score multiplier: 1 / √D.
+            a = a.transpose(1, 2).contiguous().view(B, T, N)
+            a = F.linear(a, p[f'h{i}_attn_out_weight'], p[f'h{i}_attn_out_bias'])
+            a = F.dropout(a, cfg.dropout, self.training)
+            x = x + a
 
-        # Final normalization, followed by the vocabulary projection below.
-        x = self.transformer.ln_f(x)
+            # 4. Pre-Norm → linear → GELU → linear → residual addition.
+            u = F.layer_norm(x, (N,), p[f'h{i}_mlp_norm_weight'],
+                             p[f'h{i}_mlp_norm_bias'], eps=1e-5)
+            f = F.linear(u, p[f'h{i}_mlp_in_weight'], p[f'h{i}_mlp_in_bias'])
+            f = F.gelu(f)
+            f = F.linear(f, p[f'h{i}_mlp_out_weight'], p[f'h{i}_mlp_out_bias'])
+            f = F.dropout(f, cfg.dropout, self.training)
+            x = x + f
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
-
+        # 5. Final norm and the shared vocabulary projection.
+        x = F.layer_norm(x, (N,), p['final_norm_weight'], p['final_norm_bias'], eps=1e-5)
+        if targets is None:
+            return F.linear(x[:, [-1], :], p['head_weight']), None
+        logits = F.linear(x, p['head_weight'])
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, adam_eps=1e-8):

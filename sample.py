@@ -33,13 +33,37 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # init from a model saved in a specific directory
 ckpt_path = os.path.join(out_dir, 'ckpt.pt')
 checkpoint = torch.load(ckpt_path, map_location=device)
-gptconf = GPTConfig(**checkpoint['model_args'])
+model_args = checkpoint['model_args'].copy()
+# Older checkpoints stored a scaling switch instead of explicit standard deviations.
+legacy_scaling = model_args.pop('residual_projection_scaling', True)
+if not legacy_scaling:
+    model_args.setdefault('attn_out_init_std', model_args.get('init_std', 0.02))
+    model_args.setdefault('mlp_out_init_std', model_args.get('init_std', 0.02))
+gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
 state_dict = checkpoint['model']
 unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
     if k.startswith(unwanted_prefix):
         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
+# Read checkpoints from the saved module-based version as well as this version.
+if 'transformer.wte.weight' in state_dict:
+    names = {
+        'transformer.wte.weight': 'params.token_embedding',
+        'transformer.wpe.weight': 'params.position_embedding',
+        'transformer.ln_f.weight': 'params.final_norm_weight',
+        'transformer.ln_f.bias': 'params.final_norm_bias',
+        'lm_head.weight': 'params.head_weight',
+    }
+    for i in range(gptconf.n_layer):
+        for old, new in [('ln_1', 'attn_norm'), ('attn.c_attn', 'qkv'),
+                         ('attn.c_proj', 'attn_out'), ('ln_2', 'mlp_norm'),
+                         ('mlp.c_fc', 'mlp_in'), ('mlp.c_proj', 'mlp_out')]:
+            for kind in ('weight', 'bias'):
+                names[f'transformer.h.{i}.{old}.{kind}'] = f'params.h{i}_{new}_{kind}'
+    state_dict = {names.get(k, k): v for k, v in state_dict.items()
+                  if not k.endswith('.attn.bias')}  # SDPA constructs its causal mask.
 model.load_state_dict(state_dict)
 
 model.eval()

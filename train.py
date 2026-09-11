@@ -29,7 +29,8 @@ def get_config(argv=None):
         dropout=0.0, bias=False,
         # INIT | TABLE1: matrix σ (variance is σ²), projection init, Norm γ/β.
         # These are NanoGPT defaults; embedding and head still share a tensor.
-        init_std=0.02, residual_projection_scaling=True,
+        # None selects σ/√(2L) in GPTConfig; supply a float to override either.
+        init_std=0.02, attn_out_init_std=None, mlp_out_init_std=None,
         norm_weight_init=1.0, norm_bias_init=0.0, linear_bias_init=0.0,
         # OPTIM | TABLE1: base η, Adam ε and weight decay; group rules are in model.
         learning_rate=6e-4, adam_eps=1e-8, weight_decay=0.1,
@@ -65,7 +66,11 @@ def get_config(argv=None):
                 value = literal_eval(text)
             except (SyntaxError, ValueError):
                 value = text
-            if type(value) is not type(values[key]):
+            if key in ('attn_out_init_std', 'mlp_out_init_std'):
+                if value is not None and type(value) not in (int, float):
+                    raise TypeError(f'{key} expects a number or None')
+                value = None if value is None else float(value)
+            elif type(value) is not type(values[key]):
                 raise TypeError(f'{key} expects {type(values[key]).__name__}')
             print(f'Overriding: {key} = {value}')
             values[key] = value
@@ -96,7 +101,8 @@ def main(cfg=None):
         block_size=cfg.block_size, vocab_size=get_vocab_size(cfg),
         dropout=cfg.dropout, bias=cfg.bias,
         init_std=cfg.init_std,
-        residual_projection_scaling=cfg.residual_projection_scaling,
+        attn_out_init_std=cfg.attn_out_init_std,
+        mlp_out_init_std=cfg.mlp_out_init_std,
         norm_weight_init=cfg.norm_weight_init, norm_bias_init=cfg.norm_bias_init,
         linear_bias_init=cfg.linear_bias_init,
     )
