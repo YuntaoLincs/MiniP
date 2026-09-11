@@ -1,255 +1,217 @@
 # MiniP
 
-A small NanoGPT baseline with persistent parameter tensors and an explicit functional forward. Read `model.py` for the model and initialization, and `train.py` for scratch training.
+MiniP is a small learning and experimentation repository derived from NanoGPT. Its focus is making **GPT's forward computation, parameter initialization, automatic differentiation, and AdamW updates** easy to trace in a few Python files.
 
-**Local verification:** open `notebooks/01-nanogpt-baseline-equivalence.ipynb` in your local checkout; notebooks are not included in Git. The notebook includes saved outputs, expected tolerances, CPU/MPS comparisons and an upstream repeatability control. It reports failures and skipped devices explicitly; see its results before assuming equivalence for every setting.
+**This checkout: `completep`.** This is the CompleteP experiment version; neutral defaults are available, with the initialization-order distinction documented below.
+
+## Three branches
+
+| Branch | Purpose | What to compare |
+| --- | --- | --- |
+| `nanogpt-upstream` | Unmodified NanoGPT snapshot at `3adf61e154c3fe3fca428ad6bc3818b27a3b8291` | The original implementation and README |
+| `main` | Simplified NanoGPT baseline with persistent parameter tensors and an explicit functional forward | How the original model and training loop were made easier to read |
+| `completep` | Numerical parameterization settings for the author's NanoGPT-based CompleteP implementation | Initialization, forward scaling, and optimizer-group differences |
+
+`main` and `completep` share a simplified code lineage and are maintained as parallel versions. `completep` is not necessarily a descendant of the latest `main` commit. The upstream branch stays fixed as a reference.
 
 ```bash
-uv pip install --python .venv/bin/python nbformat nbclient ipykernel jupyterlab matplotlib
-.venv/bin/python -m jupyterlab notebooks/01-nanogpt-baseline-equivalence.ipynb
+git switch main
+git diff nanogpt-upstream main -- model.py train.py sample.py
+git diff main completep -- model.py train.py
 ```
 
-Use the project `.venv` kernel, run all cells and save this notebook in place. Archive older executed versions under `results/` when replacing the current version. The entire `notebooks/` directory, local Chinese study notes in `docs/`, and historical runs in `results/` are Git-ignored. The `experiment/completep-functional` branch adds explicit numerical scaling and optimizer-group settings to align with the author's NanoGPT-based CompleteP implementation.
+## Read the algorithm through the code
 
-**Current optimizer check (local):** `notebooks/04-optimizer-grouping-check.ipynb` compares grouping and AdamW updates before/after the shared parameter roster refactor. `notebooks/03-layer-initialization-check.ipynb` documents that single-pass layer initialization changes same-seed initial weights relative to upstream; shared-weight comparisons are a separate check.
+Start with **`GPT.forward()`**, then follow the loss into the training loop and optimizer update.
 
-**Earlier CompleteP alignment (local, before the initialization-order change):** open `notebooks/02-completep-implementation-alignment.ipynb` for executed parameter audits, forward/update comparisons, a short CLI integration run, and a reduced depth coordinate check. Numerical alignment passed for the tested settings; the small depth sweep does not reproduce every Figure 7 phenomenon.
+| Step | Where to read | What happens |
+| --- | --- | --- |
+| Create parameters | [GPT.__init__](model.py#L62) | Register persistent weight/bias tensors in `nn.ParameterDict`; tie the token embedding and output head |
+| Initialize values | [initialize_parameters](model.py#L100) | Set matrix standard deviations, LayerNorm gamma/beta, and linear biases |
+| Forward | [GPT.forward](model.py#L158) | Token/position embeddings, repeated attention and MLP residual updates, final LayerNorm, logits and loss |
+| Configure updates | [configure_optimizers](model.py#L227) | List parameter tensors and roles, assign group settings, return a PyTorch AdamW object |
+| Backward and update | [train.main](train.py#L97) | Accumulate loss gradients, optionally clip them, run AdamW, and clear gradients |
+| Generate text | [sample.py](sample.py) and [GPT.generate](model.py#L322) | Load a saved checkpoint and generate tokens autoregressively |
 
-The original NanoGPT README below is retained as historical upstream documentation. Its pretrained, resume, distributed-training and other examples do not all apply to this simplified branch.
+### Forward: one visible chain
 
----
+For token IDs `x` of shape `[B, T]`, the hidden state has shape `[B, T, N]`. The model uses learned absolute position embeddings, Pre-LayerNorm, GELU, and a shared input/output embedding weight.
 
-
-# nanoGPT
-
-![nanoGPT](assets/nanogpt.jpg)
-
-
----
-
-**Update Nov 2025** nanoGPT has a new and improved cousin called [nanochat](https://github.com/karpathy/nanochat). It is very likely you meant to use/find nanochat instead. nanoGPT (this repo) is now very old and deprecated but I will leave it up for posterity.
-
----
-
-The simplest, fastest repository for training/finetuning medium-sized GPTs. It is a rewrite of [minGPT](https://github.com/karpathy/minGPT) that prioritizes teeth over education. Still under active development, but currently the file `train.py` reproduces GPT-2 (124M) on OpenWebText, running on a single 8XA100 40GB node in about 4 days of training. The code itself is plain and readable: `train.py` is a ~300-line boilerplate training loop and `model.py` a ~300-line GPT model definition, which can optionally load the GPT-2 weights from OpenAI. That's it.
-
-![repro124m](assets/gpt2_124M_loss.png)
-
-Because the code is so simple, it is very easy to hack to your needs, train new models from scratch, or finetune pretrained checkpoints (e.g. biggest one currently available as a starting point would be the GPT-2 1.3B model from OpenAI).
-
-## install
-
-```
-pip install torch numpy transformers datasets tiktoken wandb tqdm
+```text
+token IDs
+  -> token embedding + learned position embedding -> dropout
+  -> repeat for each layer:
+       LayerNorm -> QKV projection -> causal attention -> output projection
+       -> dropout -> residual addition
+       LayerNorm -> MLP expansion -> GELU -> MLP output projection
+       -> dropout -> residual addition
+  -> final LayerNorm -> vocabulary projection
+  -> logits [B, T, V] and next-token cross-entropy loss
 ```
 
-Dependencies:
+Without targets, forward returns logits only for the last position, `[B, 1, V]`, and `None` for the loss. This supports the sampling loop.
 
-- [pytorch](https://pytorch.org) <3
-- [numpy](https://numpy.org/install/) <3
--  `transformers` for huggingface transformers <3 (to load GPT-2 checkpoints)
--  `datasets` for huggingface datasets <3 (if you want to download + preprocess OpenWebText)
--  `tiktoken` for OpenAI's fast BPE code <3
--  `wandb` for optional logging <3
--  `tqdm` for progress bars <3
+`model.py` stores parameters separately from their computation. `GPT.forward()` calls `torch.nn.functional` operations directly; it does not construct new trainable layers on each call. Temporary `nn.Linear`/`nn.Embedding` constructors are used during model construction to create tensors, not to hide the forward chain.
 
-## quick start
+### Backward and AdamW: the same tensors throughout
 
-If you are not a deep learning professional and you just want to feel the magic and get your feet wet, the fastest way to get started is to train a character-level GPT on the works of Shakespeare. First, we download it as a single (1MB) file and turn it from raw text into one large stream of integers:
-
-```sh
-python data/shakespeare_char/prepare.py
+```mermaid
+flowchart TD
+    D[Token IDs and targets] --> F[GPT.forward]
+    P[Persistent model parameters] --> F
+    F --> L[Cross-entropy loss]
+    L --> B[Autograd backward]
+    B --> G[Each parameter's .grad]
+    P --> C[configure_optimizers: parameter references and settings]
+    C --> O[PyTorch AdamW]
+    G --> U[Optimizer step]
+    O --> U
+    U --> P
 ```
 
-This creates a `train.bin` and `val.bin` in that data directory. Now it is time to train your GPT. The size of it very much depends on the computational resources of your system:
+The diagram separates optimizer construction, done once, from updates, performed repeatedly. Conceptually a training iteration is:
 
-**I have a GPU**. Great, we can quickly train a baby GPT with the settings provided in the [config/train_shakespeare_char.py](config/train_shakespeare_char.py) config file:
-
-```sh
-python train.py config/train_shakespeare_char.py
+```python
+logits, loss = model(x, targets)
+loss.backward()
+optimizer.step()
+optimizer.zero_grad(set_to_none=True)
 ```
 
-If you peek inside it, you'll see that we're training a GPT with a context size of up to 256 characters, 384 feature channels, and it is a 6-layer Transformer with 6 heads in each layer. On one A100 GPU this training run takes about 3 minutes and the best validation loss is 1.4697. Based on the configuration, the model checkpoints are being written into the `--out_dir` directory `out-shakespeare-char`. So once the training finishes we can sample from the best model by pointing the sampling script at this directory:
+The actual trainer also divides the loss across gradient-accumulation microbatches, optionally clips gradients, and uses `GradScaler` calls around backward/step. With the documented CPU/MPS `float32` runs, gradient scaling is disabled.
 
-```sh
-python sample.py --out_dir=out-shakespeare-char
+There is no handwritten backward method or custom AdamW implementation. PyTorch autograd writes gradients into each parameter's `.grad`. AdamW holds **references to those same parameters**, tracks their moment estimates, and updates them in place when a step occurs. The next forward reads the updated values.
+
+### Parameter roles and optimizer groups
+
+The optimizer function lists each parameter once, alongside its role. It does not infer roles using name prefixes or suffixes. Optional biases that are `None` and parameters with `requires_grad=False` are omitted; the shared head is counted once.
+
+| Parameter role | `main`: NanoGPT grouping | `completep`: when role settings are supplied |
+| --- | --- | --- |
+| Token/position embedding, including the shared head | Weight decay | Embedding group |
+| Hidden QKV, attention output, MLP input/output matrices | Weight decay | Hidden-weight group |
+| Hidden LayerNorm gamma/beta | No weight decay | Hidden-norm group |
+| Hidden linear biases | No weight decay | Hidden-bias group |
+| Final LayerNorm gamma/beta | No weight decay | Final-norm group |
+
+**CompleteP does not add a new set of trainable parameters through optimizer grouping.** It assigns different update settings to the existing parameters.
+
+`lr`, `betas`, and `eps` passed to the AdamW constructor are defaults. A parameter group can override them. In the CompleteP branch, `lr_scale` is an additional field interpreted by **the training loop**, not automatically by AdamW:
+
+```python
+group['lr'] = scheduled_lr * group.get('lr_scale', 1.0)
 ```
 
-This generates a few samples, for example:
+Without CompleteP group settings, the experiment branch also uses the NanoGPT two-group scheme. The baseline branch has no `group_settings` argument.
 
-```
-ANGELO:
-And cowards it be strawn to my bed,
-And thrust the gates of my threats,
-Because he that ale away, and hang'd
-An one with him.
+## What was simplified from NanoGPT
 
-DUKE VINCENTIO:
-I thank your eyes against it.
+| Area | Changes in the simplified branches |
+| --- | --- |
+| Model readability | Replaced nested custom Block/Attention/MLP computation with an explicit functional forward over registered parameter tensors |
+| Initialization | Exposed matrix standard deviations and norm/bias initial values through `GPTConfig`; put initialization in a dedicated method |
+| Optimizer readability | Made the parameter roster and update-group assignment explicit |
+| Training entry point | Kept settings in `get_config()` and a single-device scratch-training workflow in `main()` |
+| Removed training paths | No resume training, pretrained GPT-2 initialization, DDP/multi-process training, `torch.compile` toggle, or W&B logging in `train.py` |
+| Removed model utilities | No pretrained-weight loader, context-cropping method, or model MFU estimator |
+| Removed analysis notebooks | Removed upstream `scaling_laws.ipynb` and `transformer_sizing.ipynb` from the working branches |
 
-DUKE VINCENTIO:
-Then will answer him to save the malm:
-And what have you tyrannous shall do this?
+Data preparation, gradient accumulation, optional gradient clipping, validation loss, warmup/cosine scheduling, checkpoint saving, and sampling remain. **No resume training does not mean no checkpoint loading:** `sample.py` still loads saved weights for generation, including supported earlier checkpoint layouts.
 
-DUKE VINCENTIO:
-If you have done evils of all disposition
-To end his power, the day of thrust for a common men
-That I leave, to fight with over-liking
-Hasting in a roseman.
-```
+`bench.py`, `configurator.py`, some upstream presets, dataset helpers, and assets remain. The old pretrained/finetuning presets are not supported entry points for this scratch trainer. Use the explicit commands below rather than assuming every inherited preset is compatible. `bench.py` is an auxiliary benchmark, not part of the train-to-checkpoint-to-sample path.
 
-lol  `¯\_(ツ)_/¯`. Not bad for a character-level model after 3 minutes of training on a GPU. Better results are quite likely obtainable by instead finetuning a pretrained GPT-2 model on this dataset (see finetuning section later).
+## CompleteP-specific additions
 
-**I only have a macbook** (or other cheap computer). No worries, we can still train a GPT but we want to dial things down a notch. I recommend getting the bleeding edge PyTorch nightly ([select it here](https://pytorch.org/get-started/locally/) when installing) as it is currently quite likely to make your code more efficient. But even without it, a simple train run could look as follows:
+The `completep` branch adds caller-supplied values for:
 
-```sh
-python train.py config/train_shakespeare_char.py --device=cpu --compile=False --eval_iters=20 --log_interval=1 --block_size=64 --batch_size=12 --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2000 --lr_decay_iters=2000 --dropout=0.0
-```
+- QKV and MLP expansion initialization standard deviations, alongside configurable output-projection standard deviations.
+- Attention score scaling (`1/D` for the author's muP setup, versus NanoGPT's default `1/sqrt(D)`), where `D` is the head width.
+- Input, attention-residual, MLP-residual, and training-output multipliers.
+- Per-role learning-rate scales, Adam epsilon, and weight decay.
 
-Here, since we are running on CPU instead of GPU we must set both `--device=cpu` and also turn off PyTorch 2.0 compile with `--compile=False`. Then when we evaluate we get a bit more noisy but faster estimate (`--eval_iters=20`, down from 200), our context size is only 64 characters instead of 256, and the batch size only 12 examples per iteration, not 64. We'll also use a much smaller Transformer (4 layers, 4 heads, 128 embedding size), and decrease the number of iterations to 2000 (and correspondingly usually decay the learning rate to around max_iters with `--lr_decay_iters`). Because our network is so small we also ease down on regularization (`--dropout=0.0`). This still runs in about ~3 minutes, but gets us a loss of only 1.88 and therefore also worse samples, but it's still good fun:
+Width/depth formulas are computed by the caller or experiment Notebook and passed as numbers. The model does not derive the full paper parameterization automatically from width and depth. Relevant additions are enclosed by `### Begin CompleteP code ###` and `### End CompleteP code ###` comments.
 
-```sh
-python sample.py --out_dir=out-shakespeare-char --device=cpu
-```
-Generates samples like this:
+The author's implementation applies output scaling when targets are supplied, including loss evaluation, but omits it on the no-target sampling path. MiniP's experiment branch follows that behavior.
 
-```
-GLEORKEN VINGHARD III:
-Whell's the couse, the came light gacks,
-And the for mought you in Aut fries the not high shee
-bot thou the sought bechive in that to doth groan you,
-No relving thee post mose the wear
-```
+There is also an initialization-order difference between the working branches: `main` retains the baseline's repeated initialization order, whereas `completep` initializes each shared tensor once in a layer-local pass. Even with neutral forward scales, their independent same-seed initial weights need not match. This is distinct from matching computations and updates **after loading the same weights**.
 
-Not bad for ~3 minutes on a CPU, for a hint of the right character gestalt. If you're willing to wait longer, feel free to tune the hyperparameters, increase the size of the network, the context length (`--block_size`), the length of training, etc.
+## Devices and execution scope
 
-Finally, on Apple Silicon Macbooks and with a recent PyTorch version make sure to add `--device=mps` (short for "Metal Performance Shaders"); PyTorch then uses the on-chip GPU that can *significantly* accelerate training (2-3X) and allow you to use larger networks. See [Issue 28](https://github.com/karpathy/nanoGPT/issues/28) for more.
+The documented small runs have been exercised on CPU and Apple Silicon MPS using `float32`. Development was on an M4 Max with Python 3.13.7 and PyTorch 2.14.0.
 
-## reproducing GPT-2
+CUDA code remains, including autocast, optional gradient scaling and CUDA-only fused AdamW selection. CUDA was not validated in the current local checks. The trainer's inherited default is still `device='cuda'`, so **explicitly select `mps` or `cpu` and `float32` on a Mac**. Multi-GPU/DDP training has been removed.
 
-A more serious deep learning professional may be more interested in reproducing GPT-2 results. So here we go - we first tokenize the dataset, in this case the [OpenWebText](https://openwebtext2.readthedocs.io/en/latest/), an open reproduction of OpenAI's (private) WebText:
+## Quick start: a small scratch run
 
-```sh
-python data/openwebtext/prepare.py
+These commands apply to `main` and to the neutral/default settings on `completep`. They are a pipeline check, not a CompleteP paper reproduction.
+
+In a fresh checkout, create an environment and install the direct dependencies for this example:
+
+```bash
+uv venv --python 3.13 .venv
+uv pip install --python .venv/bin/python torch==2.14.0 numpy==2.5.3 requests==2.34.2 tiktoken==0.14.0
+.venv/bin/python data/shakespeare_char/prepare.py
 ```
 
-This downloads and tokenizes the [OpenWebText](https://huggingface.co/datasets/openwebtext) dataset. It will create a `train.bin` and `val.bin` which holds the GPT2 BPE token ids in one sequence, stored as raw uint16 bytes. Then we're ready to kick off training. To reproduce GPT-2 (124M) you'll want at least an 8X A100 40GB node and run:
+Train on MPS:
 
-```sh
-torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
+```bash
+.venv/bin/python train.py \
+    --dataset=shakespeare_char \
+    --out_dir=out-readme-smoke \
+    --device=mps \
+    --dtype=float32 \
+    --n_layer=2 \
+    --n_head=2 \
+    --n_embd=128 \
+    --block_size=128 \
+    --batch_size=8 \
+    --gradient_accumulation_steps=1 \
+    --dropout=0.0 \
+    --learning_rate=0.001 \
+    --decay_lr=False \
+    --max_iters=100 \
+    --eval_interval=50 \
+    --eval_iters=10 \
+    --log_interval=10
 ```
 
-This will run for about 4 days using PyTorch Distributed Data Parallel (DDP) and go down to loss of ~2.85. Now, a GPT-2 model just evaluated on OWT gets a val loss of about 3.11, but if you finetune it it will come down to ~2.85 territory (due to an apparent domain gap), making the two models ~match.
+Generate from the checkpoint:
 
-If you're in a cluster environment and you are blessed with multiple GPU nodes you can make GPU go brrrr e.g. across 2 nodes like:
-
-```sh
-# Run on the first (master) node with example IP 123.456.123.456:
-torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-# Run on the worker node:
-torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
+```bash
+.venv/bin/python sample.py \
+    --out_dir=out-readme-smoke \
+    --device=mps \
+    --dtype=float32 \
+    --num_samples=1 \
+    --max_new_tokens=200 \
+    --temperature=0.8 \
+    --top_k=40
 ```
 
-It is a good idea to benchmark your interconnect (e.g. iperf3). In particular, if you don't have Infiniband then also prepend `NCCL_IB_DISABLE=1` to the above launches. Your multinode training will work, but most likely _crawl_. By default checkpoints are periodically written to the `--out_dir`. We can sample from the model by simply `python sample.py`.
+For CPU, replace `--device=mps` with `--device=cpu` in both commands. Do not pass removed options such as `--init_from`, `--compile`, or `--wandb_log`.
 
-Finally, to train on a single GPU simply run the `python train.py` script. Have a look at all of its args, the script tries to be very readable, hackable and transparent. You'll most likely want to tune a number of those variables depending on your needs.
+The model is about 0.40M parameters. Expect finite losses, a checkpoint, and generated character text; coherent language is not the goal of this short run. The loop retains NanoGPT's step convention: `max_iters=100` performs updates numbered 0 through 100, with evaluation/checkpoint saving before the corresponding update. The final saved checkpoint is therefore from before update 100.
 
-## baselines
+## Verification and local artifacts
 
-OpenAI GPT-2 checkpoints allow us to get some baselines in place for openwebtext. We can get the numbers as follows:
+Verification results have different scopes:
 
-```sh
-$ python train.py config/eval_gpt2.py
-$ python train.py config/eval_gpt2_medium.py
-$ python train.py config/eval_gpt2_large.py
-$ python train.py config/eval_gpt2_xl.py
-```
+| Check | What it establishes | Limit |
+| --- | --- | --- |
+| Baseline versus pinned NanoGPT | Initialization, forward, gradients and updates in the recorded settings | Earlier MPS tests with nonzero dropout also showed upstream self-repeatability differences; not a blanket bitwise guarantee |
+| CompleteP shared-weight alignment | Matching computations and updates against the pinned author implementation | Does not establish identical independent same-seed initialization after the layer-local initialization change |
+| Optimizer roster refactor | 20 experiment-branch and 6 baseline-branch CPU/MPS cases passed, including group order, frozen parameters, three update steps and optimizer-state loading | Checks each branch before/after the optimizer change; not a full training reproduction |
+| Reduced depth experiment | A small Figure 7-style observation was run previously | Did not reproduce every paper phenomenon; no claim of full Figure 7 reproduction |
 
-and observe the following losses on train and val:
+Notebooks, their outputs, local Chinese study notes, checkpoints, and generated datasets are not distributed with the working branches. In the author's local checkout, the latest optimizer check is `notebooks/04-optimizer-grouping-check.ipynb`; other runs record their own source versions. These paths are local references, not files expected in a fresh clone.
 
-| model | params | train loss | val loss |
-| ------| ------ | ---------- | -------- |
-| gpt2 | 124M         | 3.11  | 3.12     |
-| gpt2-medium | 350M  | 2.85  | 2.84     |
-| gpt2-large | 774M   | 2.66  | 2.67     |
-| gpt2-xl | 1558M     | 2.56  | 2.54     |
+The `notebooks/`, `docs/`, and `results/` directories are Git-ignored. Local study artifacts were removed from the published working-branch history; the untouched upstream reference still contains its original public files. Historical experiment tags remain local unless explicitly shared.
 
-However, we have to note that GPT-2 was trained on (closed, never released) WebText, while OpenWebText is just a best-effort open reproduction of this dataset. This means there is a dataset domain gap. Indeed, taking the GPT-2 (124M) checkpoint and finetuning on OWT directly for a while reaches loss down to ~2.85. This then becomes the more appropriate baseline w.r.t. reproduction.
+## Sources and license
 
-## finetuning
+- [Karpathy's NanoGPT](https://github.com/karpathy/nanoGPT), pinned at `3adf61e154c3fe3fca428ad6bc3818b27a3b8291` for the upstream branch.
+- [The author's NanoGPT-based muP/CompleteP implementation](https://github.com/EleutherAI/nanoGPT-mup), inspected at `88458c3f063b5c3c573f87435dc91f680174f0da`.
+- [CompleteP paper](https://arxiv.org/abs/2505.01618).
 
-Finetuning is no different than training, we just make sure to initialize from a pretrained model and train with a smaller learning rate. For an example of how to finetune a GPT on new text go to `data/shakespeare` and run `prepare.py` to download the tiny shakespeare dataset and render it into a `train.bin` and `val.bin`, using the OpenAI BPE tokenizer from GPT-2. Unlike OpenWebText this will run in seconds. Finetuning can take very little time, e.g. on a single GPU just a few minutes. Run an example finetuning like:
-
-```sh
-python train.py config/finetune_shakespeare.py
-```
-
-This will load the config parameter overrides in `config/finetune_shakespeare.py` (I didn't tune them much though). Basically, we initialize from a GPT2 checkpoint with `init_from` and train as normal, except shorter and with a small learning rate. If you're running out of memory try decreasing the model size (they are `{'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}`) or possibly decreasing the `block_size` (context length). The best checkpoint (lowest validation loss) will be in the `out_dir` directory, e.g. in `out-shakespeare` by default, per the config file. You can then run the code in `sample.py --out_dir=out-shakespeare`:
-
-```
-THEODORE:
-Thou shalt sell me to the highest bidder: if I die,
-I sell thee to the first; if I go mad,
-I sell thee to the second; if I
-lie, I sell thee to the third; if I slay,
-I sell thee to the fourth: so buy or sell,
-I tell thee again, thou shalt not sell my
-possession.
-
-JULIET:
-And if thou steal, thou shalt not sell thyself.
-
-THEODORE:
-I do not steal; I sell the stolen goods.
-
-THEODORE:
-Thou know'st not what thou sell'st; thou, a woman,
-Thou art ever a victim, a thing of no worth:
-Thou hast no right, no right, but to be sold.
-```
-
-Whoa there, GPT, entering some dark place over there. I didn't really tune the hyperparameters in the config too much, feel free to try!
-
-## sampling / inference
-
-Use the script `sample.py` to sample either from pre-trained GPT-2 models released by OpenAI, or from a model you trained yourself. For example, here is a way to sample from the largest available `gpt2-xl` model:
-
-```sh
-python sample.py \
-    --init_from=gpt2-xl \
-    --start="What is the answer to life, the universe, and everything?" \
-    --num_samples=5 --max_new_tokens=100
-```
-
-If you'd like to sample from a model you trained, use the `--out_dir` to point the code appropriately. You can also prompt the model with some text from a file, e.g. ```python sample.py --start=FILE:prompt.txt```.
-
-## efficiency notes
-
-For simple model benchmarking and profiling, `bench.py` might be useful. It's identical to what happens in the meat of the training loop of `train.py`, but omits much of the other complexities.
-
-Note that the code by default uses [PyTorch 2.0](https://pytorch.org/get-started/pytorch-2.0/). At the time of writing (Dec 29, 2022) this makes `torch.compile()` available in the nightly release. The improvement from the one line of code is noticeable, e.g. cutting down iteration time from ~250ms / iter to 135ms / iter. Nice work PyTorch team!
-
-## todos
-
-- Investigate and add FSDP instead of DDP
-- Eval zero-shot perplexities on standard evals (e.g. LAMBADA? HELM? etc.)
-- Finetune the finetuning script, I think the hyperparams are not great
-- Schedule for linear batch size increase during training
-- Incorporate other embeddings (rotary, alibi)
-- Separate out the optim buffers from model params in checkpoints I think
-- Additional logging around network health (e.g. gradient clip events, magnitudes)
-- Few more investigations around better init etc.
-
-## troubleshooting
-
-Note that by default this repo uses PyTorch 2.0 (i.e. `torch.compile`). This is fairly new and experimental, and not yet available on all platforms (e.g. Windows). If you're running into related error messages try to disable this by adding `--compile=False` flag. This will slow down the code but at least it will run.
-
-For some context on this repository, GPT, and language modeling it might be helpful to watch my [Zero To Hero series](https://karpathy.ai/zero-to-hero.html). Specifically, the [GPT video](https://www.youtube.com/watch?v=kCc8FmEb1nY) is popular if you have some prior language modeling context.
-
-For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
-
-[![](https://dcbadge.vercel.app/api/server/3zy8kqD9Cp?compact=true&style=flat)](https://discord.gg/3zy8kqD9Cp)
-
-## acknowledgements
-
-All nanoGPT experiments are powered by GPUs on [Lambda labs](https://lambdalabs.com), my favorite Cloud GPU provider. Thank you Lambda labs for sponsoring nanoGPT!
+The code retains the upstream [MIT license](LICENSE). The upstream branch's original README documents the original project, not the reduced workflow on the two working branches.
