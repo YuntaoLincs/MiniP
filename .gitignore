@@ -10,3 +10,9 @@ __pycache__/
 input.txt
 env/
 venv/
+
+# Local study notes, historical runs, and environment caches
+docs/
+results/
+.venv/
+.ruff_cache/
