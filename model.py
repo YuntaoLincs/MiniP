@@ -189,30 +189,86 @@ class GPT(nn.Module):
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, adam_eps=1e-8):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type,
+                             adam_eps=1e-8):
+        """List existing parameters once, assign update settings, and return AdamW."""
+        # 1. List the same trainable tensors used by forward, in registration order.
+        # The output head shares token_embedding: list that tensor only once.
+        p = self.params
+        parameter_roles = [
+            (p['token_embedding'], 'embedding'),
+            (p['position_embedding'], 'embedding'),
         ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
+        for i in range(self.config.n_layer):
+            parameter_roles.extend([
+                (p[f'h{i}_attn_norm_weight'], 'hidden_norm'),
+                (p[f'h{i}_attn_norm_bias'],   'hidden_norm'),
+                (p[f'h{i}_qkv_weight'],      'hidden_weight'),
+                (p[f'h{i}_qkv_bias'],        'hidden_bias'),
+                (p[f'h{i}_attn_out_weight'], 'hidden_weight'),
+                (p[f'h{i}_attn_out_bias'],   'hidden_bias'),
+                (p[f'h{i}_mlp_norm_weight'], 'hidden_norm'),
+                (p[f'h{i}_mlp_norm_bias'],   'hidden_norm'),
+                (p[f'h{i}_mlp_in_weight'],   'hidden_weight'),
+                (p[f'h{i}_mlp_in_bias'],     'hidden_bias'),
+                (p[f'h{i}_mlp_out_weight'],  'hidden_weight'),
+                (p[f'h{i}_mlp_out_bias'],    'hidden_bias'),
+            ])
+        parameter_roles.extend([
+            (p['final_norm_weight'], 'final_norm'),
+            (p['final_norm_bias'],   'final_norm'),
+        ])
+
+        # 2. NanoGPT updates all of these parameters, using two decay settings.
+        # Embeddings and hidden matrices decay; all Norm parameters and biases do not.
+        group_for_role = {
+            'embedding': 'decay',
+            'hidden_norm': 'no_decay',
+            'hidden_weight': 'decay',
+            'hidden_bias': 'no_decay',
+            'final_norm': 'no_decay',
+        }
+        update_settings = {
+            'decay': {'weight_decay': weight_decay},
+            'no_decay': {'weight_decay': 0.0},
+        }
+
+        # Add each existing tensor to its selected group, preserving parameter order.
+        # Missing biases are None; frozen parameters must not enter the optimizer.
+        grouped_parameters = {group: [] for group in group_for_role.values()}
+        for parameter, role in parameter_roles:
+            if parameter is not None and parameter.requires_grad:
+                group = group_for_role[role]
+                grouped_parameters[group].append(parameter)
+        optim_groups = [
+            {'params': params, **update_settings[group]}
+            for group, params in grouped_parameters.items()
+        ]
+
+        # 3. Return one AdamW object holding references to these model parameters.
+        # This call does not update weights. loss.backward() fills their .grad;
+        # optimizer.step() later updates the same tensors that forward reads.
+        # lr/betas/eps below are defaults; settings written in a group override them.
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, eps=adam_eps, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(
+            optim_groups,
+            lr=learning_rate,
+            betas=betas,
+            eps=adam_eps,
+            **extra_args,
+        )
 
+        # Parameter counts by dimension, as in NanoGPT's original diagnostics.
+        parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        matrix_params = [parameter for parameter in parameters if parameter.dim() >= 2]
+        vector_params = [parameter for parameter in parameters if parameter.dim() < 2]
+        print(f"num decayed parameter tensors: {len(matrix_params)}, "
+              f"with {sum(p.numel() for p in matrix_params):,} parameters")
+        print(f"num non-decayed parameter tensors: {len(vector_params)}, "
+              f"with {sum(p.numel() for p in vector_params):,} parameters")
+        print(f"using fused AdamW: {use_fused}")
         return optimizer
 
     @torch.no_grad()

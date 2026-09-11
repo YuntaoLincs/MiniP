@@ -2,14 +2,14 @@
 
 A small NanoGPT baseline with persistent parameter tensors and an explicit functional forward. Read `model.py` for the model and initialization, and `train.py` for scratch training.
 
-**Current verification:** open [NanoGPT Baseline Equivalence](notebooks/01-nanogpt-baseline-equivalence.ipynb). The notebook includes saved outputs, expected tolerances, CPU/MPS comparisons and an upstream repeatability control. It reports failures and skipped devices explicitly; see its results before assuming equivalence for every setting.
+**Local verification:** open `notebooks/01-nanogpt-baseline-equivalence.ipynb`; notebooks and their saved outputs are not included in Git. The notebook includes saved outputs, expected tolerances, CPU/MPS comparisons and an upstream repeatability control. It reports failures and skipped devices explicitly; see its results before assuming equivalence for every setting.
 
 ```bash
 uv pip install --python .venv/bin/python nbformat nbclient ipykernel jupyterlab matplotlib
 .venv/bin/python -m jupyterlab notebooks/01-nanogpt-baseline-equivalence.ipynb
 ```
 
-Use the project `.venv` kernel, run all cells and save this notebook in place. Archive older executed versions under `results/` when replacing the current version. Local Chinese study notes in `docs/` and historical runs in `results/` are Git-ignored. This stage does not implement CompleteP.
+Use the project `.venv` kernel, run all cells and save this notebook in place. Archive older executed versions under `results/` when replacing the current version. Local Chinese study notes in `docs/` and historical runs in `results/` are Git-ignored. This stage does not implement CompleteP. The optimizer lists parameters and their roles explicitly, using the same roster structure as the CompleteP experiment branch. See the local `notebooks/04-optimizer-grouping-check.ipynb` for before/after checks on both branches; each section identifies its source snapshots.
 
 The original NanoGPT README below is retained as historical upstream documentation. Its pretrained, resume, distributed-training and other examples do not all apply to this simplified branch.
 
