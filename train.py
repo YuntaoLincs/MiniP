@@ -18,33 +18,42 @@ from model import GPT, GPTConfig
 
 
 def get_config(argv=None):
-    """Keep all settings here: defaults → optional Python preset → CLI overrides.
-
-    MODEL/INIT/OPTIM mark research settings. TABLE1 marks related baseline values,
-    not an implementation of the paper's width/depth parameterization rules.
-    """
+    """Settings: defaults → optional Python preset → CLI overrides."""
     values = dict(
-        # MODEL: depth L, width N, heads, context and regularization.
+        # Model dimensions, context and dropout.
         n_layer=12, n_head=12, n_embd=768, block_size=1024,
         dropout=0.0, bias=False,
-        # INIT | TABLE1: matrix σ (variance is σ²), projection init, Norm γ/β.
-        # These are NanoGPT defaults; embedding and head still share a tensor.
-        # None selects σ/√(2L) in GPTConfig; supply a float to override either.
+        # NanoGPT initialization: σ for embeddings, σ/√(2L) for output projections.
+        # CompleteP presets can override each standard deviation.
         init_std=0.02, attn_out_init_std=None, mlp_out_init_std=None,
+        ### Begin CompleteP code ###
+        # CompleteP/μP width-scaled QKV and MLP initialization; None uses σ.
+        qkv_init_std=None, mlp_in_init_std=None,
+        ### End CompleteP code ###
         norm_weight_init=1.0, norm_bias_init=0.0, linear_bias_init=0.0,
-        # OPTIM | TABLE1: base η, Adam ε and weight decay; group rules are in model.
+        ### Begin CompleteP code ###
+        # CompleteP forward scales; the preset/Notebook computes Table 1 formulas.
+        attention_scale=None, input_multiplier=1.0,
+        attn_residual_multiplier=1.0, mlp_residual_multiplier=1.0,
+        training_output_multiplier=1.0,
+        ### End CompleteP code ###
+        # Base AdamW settings.
         learning_rate=6e-4, adam_eps=1e-8, weight_decay=0.1,
         beta1=0.9, beta2=0.95, grad_clip=1.0,
-        # SCHEDULE: update budget and warmup/cosine settings.
+        ### Begin CompleteP code ###
+        # CompleteP: role -> {lr_scale, eps, weight_decay}; None uses NanoGPT groups.
+        group_settings=None,
+        ### End CompleteP code ###
+        # Training length and learning-rate schedule.
         max_iters=600000, decay_lr=True, warmup_iters=2000,
         lr_decay_iters=600000, min_lr=6e-5,
-        # DATA: comparison controls; they affect the optimization problem.
+        # Dataset and batch size.
         dataset='openwebtext', batch_size=12, gradient_accumulation_steps=40,
-        # RUN: reproducibility, device and precision.
+        # Random seed, device and precision.
         seed=1337, device='cuda',
         dtype=('bfloat16' if torch.cuda.is_available()
                and torch.cuda.is_bf16_supported() else 'float16'),
-        # I/O: fold this section when reading the model/training mathematics.
+        # Output and evaluation.
         out_dir='out', eval_interval=2000, eval_iters=200, log_interval=1,
         eval_only=False, always_save_checkpoint=True,
     )
@@ -66,10 +75,18 @@ def get_config(argv=None):
                 value = literal_eval(text)
             except (SyntaxError, ValueError):
                 value = text
-            if key in ('attn_out_init_std', 'mlp_out_init_std'):
+            ### Begin CompleteP code ###
+            # Extend optional numeric overrides to QKV/MLP stds and attention scale.
+            if key in ('attn_out_init_std', 'mlp_out_init_std', 'qkv_init_std',
+                       'mlp_in_init_std', 'attention_scale'):
                 if value is not None and type(value) not in (int, float):
                     raise TypeError(f'{key} expects a number or None')
                 value = None if value is None else float(value)
+            elif key == 'group_settings':
+                # CompleteP group settings are a dictionary.
+                if value is not None and not isinstance(value, dict):
+                    raise TypeError('group_settings expects a dictionary or None')
+            ### End CompleteP code ###
             elif type(value) is not type(values[key]):
                 raise TypeError(f'{key} expects {type(values[key]).__name__}')
             print(f'Overriding: {key} = {value}')
@@ -95,7 +112,7 @@ def main(cfg=None):
     tokens = cfg.batch_size * cfg.block_size * cfg.gradient_accumulation_steps
     print(f'tokens per iteration will be: {tokens:,}')
 
-    # MODEL + INIT | TABLE1: these numerical values enter the actual GPT.
+    # Pass model dimensions, initialization and CompleteP forward scales to GPT.
     model_config = GPTConfig(
         n_layer=cfg.n_layer, n_head=cfg.n_head, n_embd=cfg.n_embd,
         block_size=cfg.block_size, vocab_size=get_vocab_size(cfg),
@@ -103,17 +120,32 @@ def main(cfg=None):
         init_std=cfg.init_std,
         attn_out_init_std=cfg.attn_out_init_std,
         mlp_out_init_std=cfg.mlp_out_init_std,
+        ### Begin CompleteP code ###
+        # Pass the width-scaled hidden initialization from the preset/Notebook.
+        qkv_init_std=cfg.qkv_init_std, mlp_in_init_std=cfg.mlp_in_init_std,
+        ### End CompleteP code ###
         norm_weight_init=cfg.norm_weight_init, norm_bias_init=cfg.norm_bias_init,
         linear_bias_init=cfg.linear_bias_init,
+        ### Begin CompleteP code ###
+        # Pass attention, input, residual and output scales to the forward chain.
+        attention_scale=cfg.attention_scale, input_multiplier=cfg.input_multiplier,
+        attn_residual_multiplier=cfg.attn_residual_multiplier,
+        mlp_residual_multiplier=cfg.mlp_residual_multiplier,
+        training_output_multiplier=cfg.training_output_multiplier,
+        ### End CompleteP code ###
     )
     print('Initializing a new model from scratch')
     model = GPT(model_config).to(cfg.device)
     scaler = torch.cuda.amp.GradScaler(enabled=(cfg.dtype == 'float16'))
 
-    # OPTIM | TABLE1: base η, β₁/β₂, Adam ε and decay reach the parameter groups.
+    # Build AdamW with the base settings and optional CompleteP parameter groups.
     optimizer = model.configure_optimizers(
         cfg.weight_decay, cfg.learning_rate, (cfg.beta1, cfg.beta2),
         device_type, adam_eps=cfg.adam_eps,
+        ### Begin CompleteP code ###
+        # Supply per-role lr_scale, eps and weight_decay; None uses NanoGPT groups.
+        group_settings=cfg.group_settings,
+        ### End CompleteP code ###
     )
 
     X, Y = get_batch('train', cfg)
@@ -122,8 +154,11 @@ def main(cfg=None):
     # Preserve upstream: max_iters=100 executes updates numbered 0..100.
     for step in range(cfg.max_iters + 1):
         lr = get_lr(step, cfg) if cfg.decay_lr else cfg.learning_rate
+        ### Begin CompleteP code ###
+        # CompleteP scales each group's scheduled learning rate; NanoGPT uses 1.
         for group in optimizer.param_groups:
-            group['lr'] = lr
+            group['lr'] = lr * group.get('lr_scale', 1.0)
+        ### End CompleteP code ###
 
         if step % cfg.eval_interval == 0:
             losses = estimate_loss(model, cfg, ctx)
@@ -146,7 +181,7 @@ def main(cfg=None):
             X, Y = get_batch('train', cfg)
             scaler.scale(loss).backward()
 
-        # OPTIM: clip accumulated gradients, update parameters, then clear gradients.
+        # Clip accumulated gradients, update parameters, then clear gradients.
         if cfg.grad_clip != 0.0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)

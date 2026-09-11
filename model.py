@@ -22,13 +22,31 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    # INIT | TABLE1: baseline σ/σ² and constant Norm/bias values, not paper scaling.
+    # Initial matrix standard deviations and LayerNorm γ/β.
+    # Width/depth formulas are evaluated by the caller, not by the GPT model.
     init_std: float = 0.02
     attn_out_init_std: float | None = None
     mlp_out_init_std: float | None = None
+    ### Begin CompleteP code ###
+    # CompleteP/μP overrides for QKV and MLP expansion initialization.
+    # NanoGPT: None keeps init_std; μP/CompleteP: caller passes σ/√width_multiplier.
+    qkv_init_std: float | None = None
+    mlp_in_init_std: float | None = None
+    ### End CompleteP code ###
     norm_weight_init: float = 1.0
     norm_bias_init: float = 0.0
     linear_bias_init: float = 0.0
+    ### Begin CompleteP code ###
+    # CompleteP forward scales; defaults retain NanoGPT computation.
+    # Attention: None -> 1/√D, μP -> 1/D; D is the width of one attention head.
+    attention_scale: float | None = None
+    input_multiplier: float = 1.0  # Applied after token + position embedding/dropout.
+    # Caller passes depth_multiplier**(-alpha); these are NOT weight init scales.
+    attn_residual_multiplier: float = 1.0
+    mlp_residual_multiplier: float = 1.0
+    # Author-compatible: output_alpha / width_multiplier, only with targets.
+    training_output_multiplier: float = 1.0
+    ### End CompleteP code ###
 
     def __post_init__(self):
         # Resolve defaults here, before GPT is constructed. Explicit values win.
@@ -80,58 +98,56 @@ class GPT(nn.Module):
         print('number of parameters: %.2fM' % (self.get_num_params() / 1e6,))
 
     def initialize_parameters(self):
-        """INIT | TABLE1: explicit matrix standard deviations and Norm γ/β.
+        """Initialize embeddings, each layer, then final norm; never called by forward.
 
-        Called by __init__, never by forward. Settings below are initial values;
-        the optimizer can subsequently update these same parameter tensors.
-        Keep random draws in NanoGPT order, including the tied head and the
-        second initialization of residual projections, for exact baseline parity.
+        Each shared tensor is initialized once here. Distributions match the
+        supplied settings, but draw order differs from the upstream two-pass init.
         """
         cfg, p = self.config, self.params
         sigma = cfg.init_std  # Standard deviation σ; variance is σ².
 
-        # 1. Token and learned position embeddings: each entry ~ N(0, σ²).
+        # NanoGPT embeddings: N(0, σ²). The output head shares token_embedding.
         nn.init.normal_(p['token_embedding'], mean=0.0, std=sigma)
         nn.init.normal_(p['position_embedding'], mean=0.0, std=sigma)
 
         for i in range(cfg.n_layer):
-            # 2. Attention Pre-Norm γ; all optional biases are filled below.
+            # Attention and MLP LayerNorm: initial γ (and optional β below).
             nn.init.constant_(p[f'h{i}_attn_norm_weight'], cfg.norm_weight_init)
-
-            # 3. Attention: packed W_Q/W_K/W_V, then output projection W_O.
-            # All entries start ~ N(0, σ²); step 7 sets W_O's final initial value.
-            nn.init.normal_(p[f'h{i}_qkv_weight'], mean=0.0, std=sigma)
-            nn.init.normal_(p[f'h{i}_attn_out_weight'], mean=0.0, std=sigma)
-
-            # 4. MLP Pre-Norm: its own γ, with the same initial value.
             nn.init.constant_(p[f'h{i}_mlp_norm_weight'], cfg.norm_weight_init)
 
-            # 5. MLP: expansion and output weights start ~ N(0, σ²).
-            # Step 7 sets the output projection's final initial value.
-            nn.init.normal_(p[f'h{i}_mlp_in_weight'], mean=0.0, std=sigma)
-            nn.init.normal_(p[f'h{i}_mlp_out_weight'], mean=0.0, std=sigma)
+            ### Begin CompleteP code ###
+            # CompleteP/μP supplies the width-scaled QKV std; NanoGPT uses σ.
+            if cfg.qkv_init_std is not None:
+                nn.init.normal_(p[f'h{i}_qkv_weight'], mean=0.0, std=cfg.qkv_init_std)
+            else:
+                nn.init.normal_(p[f'h{i}_qkv_weight'], mean=0.0, std=sigma)
+            ### End CompleteP code ###
 
-        # 6. Final LayerNorm and vocabulary head (no head bias).
-        nn.init.constant_(p['final_norm_weight'], cfg.norm_weight_init)
-        # This also overwrites token_embedding: they share the SAME tensor.
-        nn.init.normal_(p['head_weight'], mean=0.0, std=sigma)
-
-        # 7. Output projections: use the standard deviations supplied by config.
-        # This changes initial weights, not the residual addition in forward.
-        for i in range(cfg.n_layer):
+            # W_O: NanoGPT defaults to σ/√(2L); CompleteP supplies its own std.
             nn.init.normal_(p[f'h{i}_attn_out_weight'], mean=0.0, std=cfg.attn_out_init_std)
+
+            ### Begin CompleteP code ###
+            # CompleteP/μP supplies the MLP expansion std; NanoGPT uses σ.
+            if cfg.mlp_in_init_std is not None:
+                nn.init.normal_(p[f'h{i}_mlp_in_weight'], mean=0.0, std=cfg.mlp_in_init_std)
+            else:
+                nn.init.normal_(p[f'h{i}_mlp_in_weight'], mean=0.0, std=sigma)
+            ### End CompleteP code ###
+
+            # MLP output: same default projection rule, independently configurable.
             nn.init.normal_(p[f'h{i}_mlp_out_weight'], mean=0.0, std=cfg.mlp_out_init_std)
 
-        # 8. Optional biases: LayerNorm β and linear b have separate initial values.
-        # Constant fills consume no random numbers, so they can be grouped here.
-        if cfg.bias:
-            for i in range(cfg.n_layer):
+            # Optional LayerNorm β and linear biases; both default to zero.
+            if cfg.bias:
                 nn.init.constant_(p[f'h{i}_attn_norm_bias'], cfg.norm_bias_init)
                 nn.init.constant_(p[f'h{i}_mlp_norm_bias'], cfg.norm_bias_init)
                 nn.init.constant_(p[f'h{i}_qkv_bias'], cfg.linear_bias_init)
                 nn.init.constant_(p[f'h{i}_attn_out_bias'], cfg.linear_bias_init)
                 nn.init.constant_(p[f'h{i}_mlp_in_bias'], cfg.linear_bias_init)
                 nn.init.constant_(p[f'h{i}_mlp_out_bias'], cfg.linear_bias_init)
+
+        nn.init.constant_(p['final_norm_weight'], cfg.norm_weight_init)
+        if cfg.bias:
             nn.init.constant_(p['final_norm_bias'], cfg.norm_bias_init)
 
     def get_num_params(self, non_embedding=True):
@@ -152,6 +168,10 @@ class GPT(nn.Module):
         token_embedding = F.embedding(idx, p['token_embedding'])
         position_embedding = F.embedding(pos, p['position_embedding'])
         x = F.dropout(token_embedding + position_embedding, cfg.dropout, self.training)
+        ### Begin CompleteP code ###
+        # CompleteP input scaling; NanoGPT uses 1.
+        x = x * cfg.input_multiplier
+        ### End CompleteP code ###
 
         for i in range(cfg.n_layer):
             # 2. Pre-Norm: explicit γ and optional β for this layer.
@@ -166,11 +186,18 @@ class GPT(nn.Module):
             a = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, is_causal=True,
                 dropout_p=cfg.dropout if self.training else 0.0,
-            )  # Default QK score multiplier: 1 / √D.
+                ### Begin CompleteP code ###
+                # CompleteP/μP: 1/D; None retains NanoGPT's 1/√D before softmax.
+                scale=cfg.attention_scale,
+                ### End CompleteP code ###
+            )
             a = a.transpose(1, 2).contiguous().view(B, T, N)
             a = F.linear(a, p[f'h{i}_attn_out_weight'], p[f'h{i}_attn_out_bias'])
             a = F.dropout(a, cfg.dropout, self.training)
-            x = x + a
+            ### Begin CompleteP code ###
+            # CompleteP scales the attention branch by depth; NanoGPT uses 1.
+            x = x + cfg.attn_residual_multiplier * a
+            ### End CompleteP code ###
 
             # 4. Pre-Norm → linear → GELU → linear → residual addition.
             u = F.layer_norm(x, (N,), p[f'h{i}_mlp_norm_weight'],
@@ -179,40 +206,116 @@ class GPT(nn.Module):
             f = F.gelu(f)
             f = F.linear(f, p[f'h{i}_mlp_out_weight'], p[f'h{i}_mlp_out_bias'])
             f = F.dropout(f, cfg.dropout, self.training)
-            x = x + f
+            ### Begin CompleteP code ###
+            # CompleteP scales the MLP branch by depth; NanoGPT uses 1.
+            x = x + cfg.mlp_residual_multiplier * f
+            ### End CompleteP code ###
 
         # 5. Final norm and the shared vocabulary projection.
         x = F.layer_norm(x, (N,), p['final_norm_weight'], p['final_norm_bias'], eps=1e-5)
         if targets is None:
             return F.linear(x[:, [-1], :], p['head_weight']), None
+        ### Begin CompleteP code ###
+        # Match the CompleteP author's output scaling only when targets are supplied.
+        # This also applies during loss evaluation; NanoGPT uses 1.
+        x = x * cfg.training_output_multiplier
+        ### End CompleteP code ###
         logits = F.linear(x, p['head_weight'])
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, adam_eps=1e-8):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type,
+                             adam_eps=1e-8, group_settings=None):
+        """List existing parameters once, assign update settings, and return AdamW."""
+        # 1. List the same trainable tensors used by forward, in registration order.
+        # The output head shares token_embedding: list that tensor only once.
+        p = self.params
+        parameter_roles = [
+            (p['token_embedding'], 'embedding'),
+            (p['position_embedding'], 'embedding'),
         ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
+        for i in range(self.config.n_layer):
+            parameter_roles.extend([
+                (p[f'h{i}_attn_norm_weight'], 'hidden_norm'),
+                (p[f'h{i}_attn_norm_bias'],   'hidden_norm'),
+                (p[f'h{i}_qkv_weight'],      'hidden_weight'),
+                (p[f'h{i}_qkv_bias'],        'hidden_bias'),
+                (p[f'h{i}_attn_out_weight'], 'hidden_weight'),
+                (p[f'h{i}_attn_out_bias'],   'hidden_bias'),
+                (p[f'h{i}_mlp_norm_weight'], 'hidden_norm'),
+                (p[f'h{i}_mlp_norm_bias'],   'hidden_norm'),
+                (p[f'h{i}_mlp_in_weight'],   'hidden_weight'),
+                (p[f'h{i}_mlp_in_bias'],     'hidden_bias'),
+                (p[f'h{i}_mlp_out_weight'],  'hidden_weight'),
+                (p[f'h{i}_mlp_out_bias'],    'hidden_bias'),
+            ])
+        parameter_roles.extend([
+            (p['final_norm_weight'], 'final_norm'),
+            (p['final_norm_bias'],   'final_norm'),
+        ])
+
+        # 2. NanoGPT updates all of these parameters, using two decay settings.
+        # Embeddings and hidden matrices decay; all Norm parameters and biases do not.
+        group_for_role = {
+            'embedding': 'decay',
+            'hidden_norm': 'no_decay',
+            'hidden_weight': 'decay',
+            'hidden_bias': 'no_decay',
+            'final_norm': 'no_decay',
+        }
+        update_settings = {
+            'decay': {'weight_decay': weight_decay},
+            'no_decay': {'weight_decay': 0.0},
+        }
+        ### Begin CompleteP code ###
+        # CompleteP updates exactly the same parameters as NanoGPT; none are added.
+        # Keep five roles separate to assign per-role lr_scale, eps and weight_decay.
+        # Hidden Norm/bias and final Norm can need different update settings.
+        if group_settings is not None:
+            if set(group_settings) != set(group_for_role):
+                raise ValueError(f'group_settings must specify these roles: {tuple(group_for_role)}')
+            group_for_role = {role: role for role in group_for_role}
+            update_settings = group_settings
+        # AdamW uses each group's eps/weight_decay directly. lr_scale is metadata:
+        # train.py sets group['lr'] = scheduled_lr * lr_scale before each step.
+        ### End CompleteP code ###
+
+        # Add each existing tensor to its selected group, preserving parameter order.
+        # Missing biases are None; frozen parameters must not enter the optimizer.
+        grouped_parameters = {group: [] for group in group_for_role.values()}
+        for parameter, role in parameter_roles:
+            if parameter is not None and parameter.requires_grad:
+                group = group_for_role[role]
+                grouped_parameters[group].append(parameter)
+        optim_groups = [
+            {'params': params, **update_settings[group]}
+            for group, params in grouped_parameters.items()
+        ]
+
+        # 3. Return one AdamW object holding references to these model parameters.
+        # This call does not update weights. loss.backward() fills their .grad;
+        # optimizer.step() later updates the same tensors that forward reads.
+        # lr/betas/eps below are defaults; settings written in a group override them.
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, eps=adam_eps, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(
+            optim_groups,
+            lr=learning_rate,
+            betas=betas,
+            eps=adam_eps,
+            **extra_args,
+        )
 
+        # Parameter counts by dimension, as in NanoGPT's original diagnostics.
+        parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        matrix_params = [parameter for parameter in parameters if parameter.dim() >= 2]
+        vector_params = [parameter for parameter in parameters if parameter.dim() < 2]
+        print(f"num decayed parameter tensors: {len(matrix_params)}, "
+              f"with {sum(p.numel() for p in matrix_params):,} parameters")
+        print(f"num non-decayed parameter tensors: {len(vector_params)}, "
+              f"with {sum(p.numel() for p in vector_params):,} parameters")
+        print(f"using fused AdamW: {use_fused}")
         return optimizer
 
     @torch.no_grad()

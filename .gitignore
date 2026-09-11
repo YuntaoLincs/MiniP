@@ -16,3 +16,6 @@ docs/
 results/
 .venv/
 .ruff_cache/
+
+# Keep all notebooks and their saved outputs local
+/notebooks/

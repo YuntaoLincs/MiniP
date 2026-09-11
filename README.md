@@ -2,14 +2,18 @@
 
 A small NanoGPT baseline with persistent parameter tensors and an explicit functional forward. Read `model.py` for the model and initialization, and `train.py` for scratch training.
 
-**Current verification:** open [NanoGPT Baseline Equivalence](notebooks/01-nanogpt-baseline-equivalence.ipynb). The notebook includes saved outputs, expected tolerances, CPU/MPS comparisons and an upstream repeatability control. It reports failures and skipped devices explicitly; see its results before assuming equivalence for every setting.
+**Local verification:** open `notebooks/01-nanogpt-baseline-equivalence.ipynb` in your local checkout; notebooks are not included in Git. The notebook includes saved outputs, expected tolerances, CPU/MPS comparisons and an upstream repeatability control. It reports failures and skipped devices explicitly; see its results before assuming equivalence for every setting.
 
 ```bash
 uv pip install --python .venv/bin/python nbformat nbclient ipykernel jupyterlab matplotlib
 .venv/bin/python -m jupyterlab notebooks/01-nanogpt-baseline-equivalence.ipynb
 ```
 
-Use the project `.venv` kernel, run all cells and save this notebook in place. Archive older executed versions under `results/` when replacing the current version. Local Chinese study notes in `docs/` and historical runs in `results/` are Git-ignored. This stage does not implement CompleteP.
+Use the project `.venv` kernel, run all cells and save this notebook in place. Archive older executed versions under `results/` when replacing the current version. The entire `notebooks/` directory, local Chinese study notes in `docs/`, and historical runs in `results/` are Git-ignored. The `experiment/completep-functional` branch adds explicit numerical scaling and optimizer-group settings to align with the author's NanoGPT-based CompleteP implementation.
+
+**Current optimizer check (local):** `notebooks/04-optimizer-grouping-check.ipynb` compares grouping and AdamW updates before/after the shared parameter roster refactor. `notebooks/03-layer-initialization-check.ipynb` documents that single-pass layer initialization changes same-seed initial weights relative to upstream; shared-weight comparisons are a separate check.
+
+**Earlier CompleteP alignment (local, before the initialization-order change):** open `notebooks/02-completep-implementation-alignment.ipynb` for executed parameter audits, forward/update comparisons, a short CLI integration run, and a reduced depth coordinate check. Numerical alignment passed for the tested settings; the small depth sweep does not reproduce every Figure 7 phenomenon.
 
 The original NanoGPT README below is retained as historical upstream documentation. Its pretrained, resume, distributed-training and other examples do not all apply to this simplified branch.
 
