@@ -23,6 +23,10 @@ def get_config(argv=None):
         # Model dimensions, context and dropout.
         n_layer=12, n_head=12, n_embd=768, block_size=1024,
         dropout=0.0, bias=False,
+        ### Begin normalization-ablation code ###
+        # Branch: codex/normalization-ablation. Shared by CLI and Notebook calls.
+        norm_type='layernorm', extra_output_norm=False, norm_eps=1e-5,
+        ### End normalization-ablation code ###
         # NanoGPT initialization: σ for embeddings, σ/√(2L) for output projections.
         # CompleteP presets can override each standard deviation.
         init_std=0.02, attn_out_init_std=None, mlp_out_init_std=None,
@@ -117,6 +121,10 @@ def main(cfg=None):
         n_layer=cfg.n_layer, n_head=cfg.n_head, n_embd=cfg.n_embd,
         block_size=cfg.block_size, vocab_size=get_vocab_size(cfg),
         dropout=cfg.dropout, bias=cfg.bias,
+        ### Begin normalization-ablation code ###
+        norm_type=cfg.norm_type, extra_output_norm=cfg.extra_output_norm,
+        norm_eps=cfg.norm_eps,
+        ### End normalization-ablation code ###
         init_std=cfg.init_std,
         attn_out_init_std=cfg.attn_out_init_std,
         mlp_out_init_std=cfg.mlp_out_init_std,

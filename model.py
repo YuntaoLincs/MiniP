@@ -22,6 +22,12 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    ### Begin normalization-ablation code ###
+    # Branch: codex/normalization-ablation. Type and placement are independent.
+    norm_type: str = 'layernorm'  # 'layernorm' or 'rmsnorm', including final norm.
+    extra_output_norm: bool = False  # Add Norm before both W_O and W_2.
+    norm_eps: float = 1e-5
+    ### End normalization-ablation code ###
     # Initial matrix standard deviations and LayerNorm γ/β.
     # Width/depth formulas are evaluated by the caller, not by the GPT model.
     init_std: float = 0.02
@@ -49,6 +55,12 @@ class GPTConfig:
     ### End CompleteP code ###
 
     def __post_init__(self):
+        ### Begin normalization-ablation code ###
+        if self.norm_type not in ('layernorm', 'rmsnorm'):
+            raise ValueError(f'Unknown norm_type: {self.norm_type}')
+        if not math.isfinite(self.norm_eps) or self.norm_eps <= 0:
+            raise ValueError('norm_eps must be finite and positive')
+        ### End normalization-ablation code ###
         # Resolve defaults here, before GPT is constructed. Explicit values win.
         # NanoGPT default: output projection entries ~ N(0, σ²/(2L)).
         default_std = self.init_std / math.sqrt(2 * self.n_layer)
@@ -68,9 +80,13 @@ class GPT(nn.Module):
         p = self.params
 
         # Registration helpers only create/store tensors; they do no forward work.
-        def add_norm(name):
-            p[name + '_weight'] = nn.Parameter(torch.ones(N))
-            p[name + '_bias'] = nn.Parameter(torch.zeros(N)) if config.bias else None
+        ### Begin normalization-ablation code ###
+        def add_norm(name, width=N):
+            p[name + '_weight'] = nn.Parameter(torch.ones(width))
+            # RMSNorm has no beta; config.bias still controls Linear biases.
+            use_bias = config.bias and config.norm_type == 'layernorm'
+            p[name + '_bias'] = nn.Parameter(torch.zeros(width)) if use_bias else None
+        ### End normalization-ablation code ###
 
         def add_linear(name, fan_in, fan_out, bias=True):
             # Temporary Linear supplies the original constructor initialization.
@@ -89,6 +105,12 @@ class GPT(nn.Module):
             add_norm(f'h{i}_mlp_norm')
             add_linear(f'h{i}_mlp_in', N, 4 * N, config.bias)
             add_linear(f'h{i}_mlp_out', 4 * N, N, config.bias)
+            ### Begin normalization-ablation code ###
+            if config.extra_output_norm:
+                # Constant constructors preserve the shared matrices' RNG draws.
+                add_norm(f'h{i}_attn_out_norm', N)
+                add_norm(f'h{i}_mlp_out_norm', 4 * N)
+            ### End normalization-ablation code ###
         add_norm('final_norm')
         add_linear('head', N, config.vocab_size, bias=False)
 
@@ -106,14 +128,25 @@ class GPT(nn.Module):
         cfg, p = self.config, self.params
         sigma = cfg.init_std  # Standard deviation σ; variance is σ².
 
+        ### Begin normalization-ablation code ###
+        def init_norm(name):
+            nn.init.constant_(p[name + '_weight'], cfg.norm_weight_init)
+            if p[name + '_bias'] is not None:
+                nn.init.constant_(p[name + '_bias'], cfg.norm_bias_init)
+        ### End normalization-ablation code ###
+
         # NanoGPT embeddings: N(0, σ²). The output head shares token_embedding.
         nn.init.normal_(p['token_embedding'], mean=0.0, std=sigma)
         nn.init.normal_(p['position_embedding'], mean=0.0, std=sigma)
 
         for i in range(cfg.n_layer):
-            # Attention and MLP LayerNorm: initial γ (and optional β below).
-            nn.init.constant_(p[f'h{i}_attn_norm_weight'], cfg.norm_weight_init)
-            nn.init.constant_(p[f'h{i}_mlp_norm_weight'], cfg.norm_weight_init)
+            ### Begin normalization-ablation code ###
+            init_norm(f'h{i}_attn_norm')
+            init_norm(f'h{i}_mlp_norm')
+            if cfg.extra_output_norm:
+                init_norm(f'h{i}_attn_out_norm')
+                init_norm(f'h{i}_mlp_out_norm')
+            ### End normalization-ablation code ###
 
             ### Begin CompleteP code ###
             # CompleteP/μP supplies the width-scaled QKV std; NanoGPT uses σ.
@@ -137,23 +170,34 @@ class GPT(nn.Module):
             # MLP output: same default projection rule, independently configurable.
             nn.init.normal_(p[f'h{i}_mlp_out_weight'], mean=0.0, std=cfg.mlp_out_init_std)
 
-            # Optional LayerNorm β and linear biases; both default to zero.
+            ### Begin normalization-ablation code ###
+            # Norm beta is initialized above; Linear biases remain independent.
             if cfg.bias:
-                nn.init.constant_(p[f'h{i}_attn_norm_bias'], cfg.norm_bias_init)
-                nn.init.constant_(p[f'h{i}_mlp_norm_bias'], cfg.norm_bias_init)
                 nn.init.constant_(p[f'h{i}_qkv_bias'], cfg.linear_bias_init)
                 nn.init.constant_(p[f'h{i}_attn_out_bias'], cfg.linear_bias_init)
                 nn.init.constant_(p[f'h{i}_mlp_in_bias'], cfg.linear_bias_init)
                 nn.init.constant_(p[f'h{i}_mlp_out_bias'], cfg.linear_bias_init)
+            ### End normalization-ablation code ###
 
-        nn.init.constant_(p['final_norm_weight'], cfg.norm_weight_init)
-        if cfg.bias:
-            nn.init.constant_(p['final_norm_bias'], cfg.norm_bias_init)
+        ### Begin normalization-ablation code ###
+        init_norm('final_norm')
+        ### End normalization-ablation code ###
 
     def get_num_params(self, non_embedding=True):
         """Count unique parameters; optionally exclude positions as in NanoGPT."""
         count = sum(p.numel() for p in self.parameters())
         return count - self.params['position_embedding'].numel() if non_embedding else count
+
+    ### Begin normalization-ablation code ###
+    def _norm(self, x, name):
+        """Normalize the last feature dimension using registered parameters."""
+        cfg, p = self.config, self.params
+        weight = p[name + '_weight']
+        if cfg.norm_type == 'layernorm':
+            return F.layer_norm(x, weight.shape, weight, p[name + '_bias'],
+                                eps=cfg.norm_eps)
+        return F.rms_norm(x, weight.shape, weight, eps=cfg.norm_eps)
+    ### End normalization-ablation code ###
 
     def forward(self, idx, targets=None):
         """Token IDs → embeddings → repeated attention/MLP → final norm → logits."""
@@ -175,8 +219,9 @@ class GPT(nn.Module):
 
         for i in range(cfg.n_layer):
             # 2. Pre-Norm: explicit γ and optional β for this layer.
-            u = F.layer_norm(x, (N,), p[f'h{i}_attn_norm_weight'],
-                             p[f'h{i}_attn_norm_bias'], eps=1e-5)
+            ### Begin normalization-ablation code ###
+            u = self._norm(x, f'h{i}_attn_norm')
+            ### End normalization-ablation code ###
 
             # 3. Project Q/K/V, split heads, and apply causal attention.
             q, k, v = F.linear(u, p[f'h{i}_qkv_weight'], p[f'h{i}_qkv_bias']).split(N, dim=-1)
@@ -192,6 +237,11 @@ class GPT(nn.Module):
                 ### End CompleteP code ###
             )
             a = a.transpose(1, 2).contiguous().view(B, T, N)
+            ### Begin normalization-ablation code ###
+            # W_O input: normalize across all N concatenated head features.
+            if cfg.extra_output_norm:
+                a = self._norm(a, f'h{i}_attn_out_norm')
+            ### End normalization-ablation code ###
             a = F.linear(a, p[f'h{i}_attn_out_weight'], p[f'h{i}_attn_out_bias'])
             a = F.dropout(a, cfg.dropout, self.training)
             ### Begin CompleteP code ###
@@ -200,10 +250,16 @@ class GPT(nn.Module):
             ### End CompleteP code ###
 
             # 4. Pre-Norm → linear → GELU → linear → residual addition.
-            u = F.layer_norm(x, (N,), p[f'h{i}_mlp_norm_weight'],
-                             p[f'h{i}_mlp_norm_bias'], eps=1e-5)
+            ### Begin normalization-ablation code ###
+            u = self._norm(x, f'h{i}_mlp_norm')
+            ### End normalization-ablation code ###
             f = F.linear(u, p[f'h{i}_mlp_in_weight'], p[f'h{i}_mlp_in_bias'])
             f = F.gelu(f)
+            ### Begin normalization-ablation code ###
+            # W_2 input: normalize the 4N features after GELU.
+            if cfg.extra_output_norm:
+                f = self._norm(f, f'h{i}_mlp_out_norm')
+            ### End normalization-ablation code ###
             f = F.linear(f, p[f'h{i}_mlp_out_weight'], p[f'h{i}_mlp_out_bias'])
             f = F.dropout(f, cfg.dropout, self.training)
             ### Begin CompleteP code ###
@@ -212,7 +268,9 @@ class GPT(nn.Module):
             ### End CompleteP code ###
 
         # 5. Final norm and the shared vocabulary projection.
-        x = F.layer_norm(x, (N,), p['final_norm_weight'], p['final_norm_bias'], eps=1e-5)
+        ### Begin normalization-ablation code ###
+        x = self._norm(x, 'final_norm')
+        ### End normalization-ablation code ###
         if targets is None:
             return F.linear(x[:, [-1], :], p['head_weight']), None
         ### Begin CompleteP code ###
@@ -249,6 +307,14 @@ class GPT(nn.Module):
                 (p[f'h{i}_mlp_out_weight'],  'hidden_weight'),
                 (p[f'h{i}_mlp_out_bias'],    'hidden_bias'),
             ])
+            ### Begin normalization-ablation code ###
+            if self.config.extra_output_norm:
+                for name in (f'h{i}_attn_out_norm', f'h{i}_mlp_out_norm'):
+                    parameter_roles.extend([
+                        (p[name + '_weight'], 'hidden_norm'),
+                        (p[name + '_bias'],   'hidden_norm'),
+                    ])
+            ### End normalization-ablation code ###
         parameter_roles.extend([
             (p['final_norm_weight'], 'final_norm'),
             (p['final_norm_bias'],   'final_norm'),

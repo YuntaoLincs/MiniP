@@ -2,15 +2,54 @@
 
 MiniP is a small learning and experimentation repository derived from NanoGPT. Its focus is making **GPT's forward computation, parameter initialization, automatic differentiation, and AdamW updates** easy to trace in a few Python files.
 
-**This checkout: `completep`.** This is the CompleteP experiment version; neutral defaults are available, with the initialization-order distinction documented below.
+<!-- ### Begin normalization-ablation code ### -->
+**This checkout: `codex/normalization-ablation`.** Branched from `completep` at `f470927`, this version adds selectable LayerNorm/RMSNorm and optional normalization immediately before both W_O and W_2. Defaults retain the previous LayerNorm computation. CompleteP settings remain available; they are not enabled by the branch name.
 
-## Three branches
+### Four normalization configurations
+
+| Configuration | `norm_type` | `extra_output_norm` |
+| --- | --- | --- |
+| LN | `'layernorm'` | `False` |
+| LN + extra | `'layernorm'` | `True` |
+| RMS | `'rmsnorm'` | `False` |
+| RMS + extra | `'rmsnorm'` | `True` |
+
+`norm_type` selects the two existing pre-norms in every block and the final norm. With `extra_output_norm=True`, each block also normalizes the concatenated attention output over N features before W_O, and the GELU output over 4N features before W_2. Each added norm has its own trainable scale, initialized via `norm_weight_init`. All norm parameters use the existing hidden-norm optimizer role, without weight decay under the neutral/default optimizer settings.
+
+`norm_eps` defaults to `1e-5` for both types. RMSNorm has no beta; `bias` still controls Linear biases and LayerNorm beta. For the four-way comparison with matching baseline parameter counts, explicitly set `bias=False`.
+
+Notebook callers can pass these fields to `GPTConfig`, or obtain a training configuration with `get_config([])`, set the fields, and call `train.main(cfg)`. The CLI also accepts the three fields. Saved model configurations include them so sampling reconstructs the same architecture.
+
+Every branch-specific code change is enclosed by `### Begin normalization-ablation code ###` and `### End normalization-ablation code ###`. The new options do not change matrix initialization distributions or their random draw order.
+
+Validation covered CPU and MPS: baseline parity against `f470927`, all four variants with Linear bias on/off, an independent forward expression, shared matrix initialization, optimizer membership and added-scale updates, and trainer/checkpoint configuration round-trips. These are small correctness checks, not training-performance results.
+
+### Saved normalization experiments
+
+Only these three experiment notebooks are included, with their saved outputs:
+
+| Notebook | Experiment |
+| --- | --- |
+| [07](notebooks/07-shakespeare-normalization-ablation.ipynb) | Four normalization variants at 4 layers; all reached 5,000 updates |
+| [08](notebooks/08-completep-depth-normalization-ablation.ipynb) | CompleteP depth sweep; all four variants at depths 2–64 reached 1,000 updates; the 128-layer stage was paused |
+| [09](notebooks/09-residual-scaling-fixed-lr-ablation.ipynb) | Unscaled vs. scaled residuals at depths 2–64, constant LR 0.0003; 44 actual runs reached 1,000 updates, representing 48 conditions with depth-2 reuse |
+
+Notebook 09 ends with an embedded six-row overview comparing LayerNorm/RMSNorm with and without extra normalization. Its final, self-contained plotting cell exports a PNG and a single-page A3 PDF from saved metrics. Notebook 08 retains the intentional interruption output from its controlled stop.
+
+The notebooks preserve the local execution configuration and saved figures. Raw metrics, datasets, checkpoints, and exported image/PDF files remain excluded from Git. To rerun or resume, configure the data, device, and result paths for your machine; existing resume paths refer to the original local runs. Regenerating reports requires the corresponding metrics files. Supporting scripts cover notebook execution, the Notebook 08 continuation queue, and clearer per-depth Notebook 09 reports.
+
+## Branches
+<!-- ### End normalization-ablation code ### -->
 
 | Branch | Purpose | What to compare |
 | --- | --- | --- |
 | `nanogpt-upstream` | Unmodified NanoGPT snapshot at `3adf61e154c3fe3fca428ad6bc3818b27a3b8291` | The original implementation and README |
 | `main` | Simplified NanoGPT baseline with persistent parameter tensors and an explicit functional forward | How the original model and training loop were made easier to read |
 | `completep` | Numerical parameterization settings for the author's NanoGPT-based CompleteP implementation | Initialization, forward scaling, and optimizer-group differences |
+<!-- ### Begin normalization-ablation code ### -->
+
+`codex/normalization-ablation` extends `completep` with the four normalization configurations above. Compare its model/trainer changes against `completep`.
+<!-- ### End normalization-ablation code ### -->
 
 `main` and `completep` share a simplified code lineage and are maintained as parallel versions. `completep` is not necessarily a descendant of the latest `main` commit. The upstream branch stays fixed as a reference.
 
@@ -26,12 +65,12 @@ Start with **`GPT.forward()`**, then follow the loss into the training loop and 
 
 | Step | Where to read | What happens |
 | --- | --- | --- |
-| Create parameters | [GPT.__init__](model.py#L62) | Register persistent weight/bias tensors in `nn.ParameterDict`; tie the token embedding and output head |
-| Initialize values | [initialize_parameters](model.py#L100) | Set matrix standard deviations, LayerNorm gamma/beta, and linear biases |
-| Forward | [GPT.forward](model.py#L158) | Token/position embeddings, repeated attention and MLP residual updates, final LayerNorm, logits and loss |
-| Configure updates | [configure_optimizers](model.py#L227) | List parameter tensors and roles, assign group settings, return a PyTorch AdamW object |
-| Backward and update | [train.main](train.py#L97) | Accumulate loss gradients, optionally clip them, run AdamW, and clear gradients |
-| Generate text | [sample.py](sample.py) and [GPT.generate](model.py#L322) | Load a saved checkpoint and generate tokens autoregressively |
+| Create parameters | [GPT.__init__](model.py#L74) | Register persistent weight/bias tensors in `nn.ParameterDict`; tie the token embedding and output head |
+| Initialize values | [initialize_parameters](model.py#L122) | Set matrix standard deviations, norm scales/offsets, and linear biases |
+| Forward | [GPT.forward](model.py#L202) | Token/position embeddings, repeated attention and MLP residual updates, final norm, logits and loss |
+| Configure updates | [configure_optimizers](model.py#L285) | List parameter tensors and roles, assign group settings, return a PyTorch AdamW object |
+| Backward and update | [train.main](train.py#L101) | Accumulate loss gradients, optionally clip them, run AdamW, and clear gradients |
+| Generate text | [sample.py](sample.py) and [GPT.generate](model.py#L388) | Load a saved checkpoint and generate tokens autoregressively |
 
 ### Forward: one visible chain
 

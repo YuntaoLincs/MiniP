@@ -17,5 +17,12 @@ results/
 .venv/
 .ruff_cache/
 
-# Keep all notebooks and their saved outputs local
-/notebooks/
+# Publish only the normalization experiments and their supporting scripts.
+# Other notebooks, temporary notebook copies, and generated reports stay local.
+/notebooks/*
+!/notebooks/07-shakespeare-normalization-ablation.ipynb
+!/notebooks/08-completep-depth-normalization-ablation.ipynb
+!/notebooks/09-residual-scaling-fixed-lr-ablation.ipynb
+!/notebooks/execute_normalization_notebook.py
+!/notebooks/render_notebook09_readable.py
+!/notebooks/run_completep_depth_stages.py
