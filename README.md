@@ -3,7 +3,7 @@
 MiniP is a small learning and experimentation repository derived from NanoGPT. Its focus is making **GPT's forward computation, parameter initialization, automatic differentiation, and AdamW updates** easy to trace in a few Python files.
 
 <!-- ### Begin normalization-ablation code ### -->
-**This checkout: `codex/normalization-ablation`.** Branched from `completep` at `f470927`, this version adds selectable LayerNorm/RMSNorm and optional normalization immediately before both W_O and W_2. Defaults retain the previous LayerNorm computation. CompleteP settings remain available; they are not enabled by the branch name.
+**This checkout: `normalization-ablation`.** Branched from `completep` at `f470927`, this version adds selectable LayerNorm/RMSNorm and optional normalization immediately before both W_O and W_2. Defaults retain the previous LayerNorm computation. CompleteP settings remain available; they are not enabled by the branch name.
 
 ### Four normalization configurations
 
@@ -48,7 +48,7 @@ The notebooks preserve the local execution configuration and saved figures. Raw 
 | `completep` | Numerical parameterization settings for the author's NanoGPT-based CompleteP implementation | Initialization, forward scaling, and optimizer-group differences |
 <!-- ### Begin normalization-ablation code ### -->
 
-`codex/normalization-ablation` extends `completep` with the four normalization configurations above. Compare its model/trainer changes against `completep`.
+`normalization-ablation` extends `completep` with the four normalization configurations above. Compare its model/trainer changes against `completep`.
 <!-- ### End normalization-ablation code ### -->
 
 `main` and `completep` share a simplified code lineage and are maintained as parallel versions. `completep` is not necessarily a descendant of the latest `main` commit. The upstream branch stays fixed as a reference.
